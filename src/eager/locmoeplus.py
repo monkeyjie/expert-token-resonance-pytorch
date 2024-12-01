@@ -1,14 +1,12 @@
-import math
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Unofficial implementation of https://arxiv.org/abs/2406.00023 
 
 class GrAPLayer(nn.Module):
-    """Grouped Average Pooling as described in LocMoE paper."""
+    """Grouped Average Pooling as described in paper."""
 
     def __init__(self, hidden_dim: int, num_experts: int):
         super().__init__()
@@ -19,12 +17,31 @@ class GrAPLayer(nn.Module):
         self.num_experts = num_experts
         self.group_size = hidden_dim // num_experts
 
+        # Initialize expert-token affinity matrix Waff as described in paper
+        waff = torch.zeros(num_experts, hidden_dim)
+        group_size = hidden_dim // num_experts
+        scale = num_experts / hidden_dim  # n/d scaling factor
+
+        for i in range(num_experts):
+            start_idx = i * group_size
+            end_idx = (i + 1) * group_size
+            waff[i, start_idx:end_idx] = scale
+
+        self.register_buffer("waff", waff)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: [batch_size, seq_length, hidden_dim]
-        # Reshape to group dimensions
-        x = x.view(*x.shape[:-1], self.num_experts, self.group_size)
-        # Average pool over group dimension
-        return x.mean(dim=-1)
+        """
+        Compute GrAP features using affinity matrix.
+        Args:
+            x: Input tensor of shape [batch_size, seq_length, hidden_dim]
+        Returns:
+            GrAP features of shape [batch_size, seq_length, num_experts]
+        """
+        # Apply affinity matrix to get expert scores
+        # waff has shape [num_experts, hidden_dim]
+        # x has shape [batch_size, seq_length, hidden_dim]
+        # Result will have shape [batch_size, seq_length, num_experts]
+        return torch.matmul(x, self.waff.t())
 
 
 class LocMoEPlusLayer(nn.Module):
@@ -44,7 +61,7 @@ class LocMoEPlusLayer(nn.Module):
         self.min_capacity = min_capacity
         self.locality_weight = locality_weight
 
-        # GrAP layer for token feature extraction
+        # GrAP layer for feature extraction with affinity matrix
         self.grap = GrAPLayer(input_dim, num_experts)
 
         # Initialize experts
@@ -60,7 +77,7 @@ class LocMoEPlusLayer(nn.Module):
             ]
         )
 
-        # Initialize router weights with orthogonal initialization
+        # Router uses GrAP features to generate scores
         self.router = nn.Linear(num_experts, num_experts, bias=False)
         nn.init.orthogonal_(self.router.weight)
 
@@ -68,24 +85,47 @@ class LocMoEPlusLayer(nn.Module):
         self.affinity_threshold = nn.Parameter(torch.tensor(0.5))
 
     def compute_affinity_scores(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute cosine similarity between tokens and router weights.
-        This function is still not clear - it appears returning x_pooled works better..."""
-        # Apply GrAP for feature extraction
-        x_pooled = self.grap(x)  # shape: [batch_size, seq_length, num_experts]
-        
-        # This part is unclear - we can return x_pooled directly and that works nicely but paper implies matmul / norm * norm...? 
-        # Normalize features and weights
-        x_norm = F.normalize(x_pooled, dim=-1)
-        w_norm = F.normalize(self.router.weight, dim=1)
+        """
+        Compute expert-token affinity scores using equation (4) from paper.
+        delta ti = cos(xt, wi) := xt^T wi/(||xt|| * ||wi||)
 
-        # Compute affinities
-        affinities = torch.matmul(x_norm, w_norm)
-        return affinities
+        Args:
+            x: Input tensor of shape [batch_size, seq_length, hidden_dim]
+        Returns:
+            Affinity scores of shape [batch_size, seq_length, num_experts]
+        """
+        batch_size, seq_length, hidden_dim = x.shape
+
+        # Compute x^T w
+        numerator = torch.matmul(
+            x, self.grap.waff.t()
+        )  # [batch_size, seq_length, num_experts]
+
+        x_norm = torch.norm(x, p=2, dim=-1, keepdim=True)  # [batch_size, seq_length, 1]
+
+        w_norm = torch.norm(self.grap.waff, p=2, dim=-1)  # [num_experts]
+
+        # Compute denominator ||x|| * ||w||
+        denominator = torch.matmul(
+            x_norm, w_norm.view(1, -1)
+        )  # [batch_size, seq_length, num_experts]
+
+        # Final affinity scores
+        affinity_scores = numerator / (
+            denominator + 1e-9
+        )  # Added epsilon to avoid division by zero
+
+        # cosine similarity is in [-1, 1]
+        # verify this:
+        # print(
+        #    f"affinity_scores min: {affinity_scores.min()}, max: {affinity_scores.max()}"
+        # )
+        return affinity_scores
 
     def compute_adaptive_capacity(
         self, affinity_scores: torch.Tensor, sequence_length: int
     ) -> int:
-        """Compute adaptive capacity based on affinity scores."""
+        """Calculate adaptive capacity based on mean affinity score."""
         mean_affinity = affinity_scores.mean()
         adaptive_capacity = max(
             self.min_capacity,
@@ -101,20 +141,22 @@ class LocMoEPlusLayer(nn.Module):
         mask: Optional[torch.Tensor] = None,
         local_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Hybrid routing combining TCR and ECR strategies with adaptive capacity."""
+        """
+        Implement hybrid TCR+ECR routing with adaptive capacity.
+        As described in equations (5) and (6) from paper.
+        """
         batch_size, sequence_length, _ = inputs.shape
 
         # Compute affinity scores and routing probabilities
         affinity_scores = self.compute_affinity_scores(inputs)
         router_probs = F.softmax(affinity_scores, dim=-1)
 
-        # Compute adaptive capacity for this batch
+        # Get adaptive capacity
         adaptive_capacity = self.compute_adaptive_capacity(
             affinity_scores, sequence_length
         )
 
-        # Create dispatch masks combining TCR and ECR
-        # First apply TCR - each token picks its top expert
+        # TCR: Each token picks its top expert
         tcr_mask = torch.zeros(
             batch_size, sequence_length, self.num_experts, device=inputs.device
         )
@@ -124,7 +166,7 @@ class LocMoEPlusLayer(nn.Module):
         seq_idx = torch.arange(sequence_length, device=inputs.device).unsqueeze(0)
         tcr_mask[batch_idx, seq_idx, top_expert_idx] = 1.0
 
-        # Then apply ECR - each expert picks its top-k tokens based on adaptive capacity
+        # ECR: Each expert picks its top-k tokens
         ecr_mask = torch.zeros_like(tcr_mask)
         for expert_idx in range(self.num_experts):
             expert_affinity = affinity_scores[..., expert_idx]
@@ -134,7 +176,7 @@ class LocMoEPlusLayer(nn.Module):
             batch_idx = torch.arange(batch_size, device=inputs.device).unsqueeze(1)
             ecr_mask[batch_idx, top_tokens, expert_idx] = 1.0
 
-        # Combine TCR and ECR masks
+        # Combine masks for hybrid routing
         dispatch_mask = tcr_mask * ecr_mask
 
         if mask is not None:
@@ -166,12 +208,11 @@ class LocMoEPlusLayer(nn.Module):
         mask: Optional[torch.Tensor] = None,
         local_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass combining routed expert outputs."""
+        """Forward pass with expert-token resonance routing."""
         router_probs, affinity_scores, dispatch_mask = self.route_tokens(
             inputs, mask, local_indices
         )
 
-        # Dispatch tokens to experts and combine outputs
         final_output = torch.zeros_like(inputs)
         for expert_idx, expert in enumerate(self.experts):
             expert_mask = dispatch_mask[..., expert_idx].unsqueeze(-1)
@@ -180,7 +221,6 @@ class LocMoEPlusLayer(nn.Module):
                 expert_output = expert(expert_input)
                 final_output = final_output + expert_output
 
-        # Compute auxiliary losses if training
         if self.training:
             # Router entropy loss
             router_entropy = (
@@ -196,7 +236,7 @@ class LocMoEPlusLayer(nn.Module):
             # Locality loss
             locality_loss = self.compute_locality_loss(router_probs, local_indices)
 
-            # Combine losses
+            # Combined auxiliary loss
             self.aux_loss = (
                 router_entropy + affinity_loss + self.locality_weight * locality_loss
             )
