@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# An unofficial implementation of https://arxiv.org/abs/2406.00023 
+# Expert-Token Resonance: Redefining MoE Expert Routing through affinity driven active selection.
 
 class GrAPLayer(nn.Module):
     """Grouped Average Pooling as described in paper."""
