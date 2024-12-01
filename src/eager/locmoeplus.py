@@ -68,10 +68,12 @@ class LocMoEPlusLayer(nn.Module):
         self.affinity_threshold = nn.Parameter(torch.tensor(0.5))
 
     def compute_affinity_scores(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute cosine similarity between tokens and router weights."""
+        """Compute cosine similarity between tokens and router weights.
+        This function is still not clear - it appears returning x_pooled works better..."""
         # Apply GrAP for feature extraction
         x_pooled = self.grap(x)  # shape: [batch_size, seq_length, num_experts]
-
+        
+        # This part is unclear - we can return x_pooled directly and that works nicely but paper implies matmul / norm * norm...? 
         # Normalize features and weights
         x_norm = F.normalize(x_pooled, dim=-1)
         w_norm = F.normalize(self.router.weight, dim=1)
